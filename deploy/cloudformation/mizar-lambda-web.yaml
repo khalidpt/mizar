@@ -1,0 +1,426 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Mizar web app on AWS Lambda Web Functions, behind CloudFront with OpenID Connect or SAML (IAM Identity Center)
+  sign-in, or with none for a public demo. Only CloudFront can invoke the endpoint (IamAuth with origin access control). Reads snapshots from an
+  existing s3:// store; run the collector elsewhere (see README). Build and upload the package first (README, "AWS Lambda Web Functions").
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Mizar }
+        Parameters: [FunctionName, CodeBucket, CodeKey, CodeVersion, ConfigJson, StoreBucket, StorePrefix]
+      - Label: { default: Address }
+        Parameters: [DomainName, CertificateArn, HostedZoneId, WebAclArn]
+      - Label: { default: Access }
+        Parameters: [PublicAccess]
+      - Label: { default: Sign-in (OpenID Connect) }
+        Parameters: [OidcIssuer, OidcClientId, OidcClientSecret]
+      - Label: { default: "Sign-in (SAML, e.g. IAM Identity Center)" }
+        Parameters: [SamlEntryPoint, SamlIdpCert, SamlIdpIssuer]
+      - Label: { default: Who may sign in }
+        Parameters: [AllowedEmails, AllowedDomains, AllowedGroups]
+      - Label: { default: Operations }
+        Parameters: [TimeoutSeconds, KmsKeyArn, LogRetentionDays]
+
+Parameters:
+  FunctionName:
+    Type: String
+    Default: mizar
+    AllowedPattern: "^[a-zA-Z0-9]([a-zA-Z0-9_-]{0,62}[a-zA-Z0-9])?$"
+    Description: Web Function name; logs go to /aws/lambda/web/<name>.
+  CodeBucket:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: >-
+      Versioned bucket holding the package, with a bucket policy letting lambda.amazonaws.com read it (see README).
+  CodeKey:
+    Type: String
+    Default: mizar-web.zip
+    Description: Key of the package built as in the README.
+  CodeVersion:
+    Type: String
+    Description: >-
+      S3 version id of the package. Each new version creates a new revision and moves the endpoint to it.
+  ConfigJson:
+    Type: String
+    Default: "{}"
+    Description: >-
+      mizar.config.json contents for the web app (ui settings, ...). No secrets. Store and sign-in are set by this
+      template.
+  StoreBucket:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: Bucket of the s3:// snapshot store the collector writes to.
+  StorePrefix:
+    Type: String
+    Default: mizar/
+    AllowedPattern: "^([^/].*/)?$"
+    Description: >-
+      Key prefix of the store, with a trailing slash: s3://my-bucket/mizar → "mizar/". Empty for the whole
+      bucket.
+  DomainName:
+    Type: String
+    Description: Host name users open, e.g. mizar.example.com. Covered by CertificateArn.
+  CertificateArn:
+    Type: String
+    AllowedPattern: "^arn:aws[a-z-]*:acm:us-east-1:\\d{12}:certificate/.+$"
+    Description: ACM certificate for DomainName. CloudFront needs it in us-east-1, whatever region this stack is in.
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: Optional Route 53 hosted zone to create DomainName in. Empty to point DNS at CloudFront yourself.
+  WebAclArn:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional AWS WAF web ACL (scope CLOUDFRONT, in us-east-1), e.g. an IP allow list. Recommended: the
+      distribution is reachable from the internet.
+  PublicAccess:
+    Type: String
+    Default: "false"
+    AllowedValues: ["false", "true"]
+    Description: >-
+      "true" serves Mizar to anyone, without sign-in (MIZAR_AUTH_MODE=none): for a public demo of a store that holds
+      nothing you wouldn't publish, such as mock snapshots. Leave the Oidc*, Saml* and Allowed* parameters empty.
+  OidcIssuer:
+    Type: String
+    Default: ""
+    Description: >-
+      OpenID Connect issuer URL. Register the redirect URI https://<DomainName>/auth/callback there. Set this or
+      SamlEntryPoint.
+  OidcClientId:
+    Type: String
+    Default: ""
+  OidcClientSecret:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Client secret, kept in Secrets Manager. Empty for a public client.
+  SamlEntryPoint:
+    Type: String
+    Default: ""
+    Description: >-
+      SAML identity provider sign-in URL (IAM Identity Center: "IAM Identity Center sign-in URL"). Register the ACS URL
+      https://<DomainName>/auth/saml/acs and audience https://<DomainName> there. Set this or OidcIssuer.
+  SamlIdpCert:
+    Type: String
+    Default: ""
+    Description: >-
+      The provider's signing certificate: the base64 between its BEGIN and END lines, on one line.
+  SamlIdpIssuer:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional issuer the provider's responses must name (IAM Identity Center: "IAM Identity Center issuer URL").
+  AllowedEmails:
+    Type: String
+    Default: ""
+    Description: Optional comma-separated emails allowed to sign in.
+  AllowedDomains:
+    Type: String
+    Default: ""
+    Description: Optional comma-separated email domains allowed to sign in.
+  AllowedGroups:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional comma-separated groups (the ID token's "groups" claim, or a SAML attribute named "groups") allowed to
+      sign in.
+  TimeoutSeconds:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 60
+    Description: Longest a request may run, in seconds (also CloudFront's origin read timeout, at most 60).
+  KmsKeyArn:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional customer managed KMS key for the code and environment variables (which hold the sign-in secrets).
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+Rules:
+  OneSignIn:
+    Assertions:
+      - Assert: !Or
+          - !Equals [!Ref PublicAccess, "true"]
+          - !Not [!Equals [!Ref OidcIssuer, ""]]
+          - !Not [!Equals [!Ref SamlEntryPoint, ""]]
+        AssertDescription: Set OidcIssuer (OpenID Connect) or SamlEntryPoint (SAML), or PublicAccess=true.
+      - Assert: !Or
+          - !Equals [!Ref PublicAccess, "false"]
+          - !And
+            - !Equals [!Ref OidcIssuer, ""]
+            - !Equals [!Ref SamlEntryPoint, ""]
+            - !Equals [!Ref AllowedEmails, ""]
+            - !Equals [!Ref AllowedDomains, ""]
+            - !Equals [!Ref AllowedGroups, ""]
+        AssertDescription: PublicAccess=true has no sign-in; leave the Oidc*, Saml* and Allowed* parameters empty.
+      - Assert: !Or [!Equals [!Ref OidcIssuer, ""], !Equals [!Ref SamlEntryPoint, ""]]
+        AssertDescription: Set OidcIssuer or SamlEntryPoint, not both.
+      - Assert: !Or [!Equals [!Ref OidcIssuer, ""], !Not [!Equals [!Ref OidcClientId, ""]]]
+        AssertDescription: OpenID Connect sign-in needs OidcClientId.
+      - Assert: !Or [!Equals [!Ref SamlEntryPoint, ""], !Not [!Equals [!Ref SamlIdpCert, ""]]]
+        AssertDescription: SAML sign-in needs SamlIdpCert.
+
+Conditions:
+  IsPublic: !Equals [!Ref PublicAccess, "true"]
+  HasSignIn: !Not [!Condition IsPublic]
+  HasOidc: !Not [!Equals [!Ref OidcIssuer, ""]]
+  HasSaml: !Not [!Equals [!Ref SamlEntryPoint, ""]]
+  HasSamlIdpIssuer: !Not [!Equals [!Ref SamlIdpIssuer, ""]]
+  HasClientSecret: !Not [!Equals [!Ref OidcClientSecret, ""]]
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, ""]]
+  HasWebAcl: !Not [!Equals [!Ref WebAclArn, ""]]
+  HasKmsKey: !Not [!Equals [!Ref KmsKeyArn, ""]]
+  HasAllowedEmails: !Not [!Equals [!Ref AllowedEmails, ""]]
+  HasAllowedDomains: !Not [!Equals [!Ref AllowedDomains, ""]]
+  HasAllowedGroups: !Not [!Equals [!Ref AllowedGroups, ""]]
+
+Resources:
+  # --- Secrets -----------------------------------------------------------------------------------------------------
+
+  # Mizar reads its secrets from the environment: the revision resolves these when it is created.
+  SessionSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: HasSignIn
+    Properties:
+      Description: Mizar session cookie encryption key
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  ClientSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: HasClientSecret
+    Properties:
+      Description: Mizar OpenID Connect client secret
+      SecretString: !Ref OidcClientSecret
+
+  # --- Role and logs -----------------------------------------------------------------------------------------------
+
+  # Lambda writes logs in the serving region (.local) and centralizes them in the home region.
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/web/${FunctionName}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  LocalLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/web/${FunctionName}.local"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # The web app only writes logs and reads snapshots.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Mizar web app on Lambda Web Functions (logs, reads snapshots)
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MizarWeb
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  - !GetAtt LogGroup.Arn
+                  - !GetAtt LocalLogGroup.Arn
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${StoreBucket}"
+                Condition:
+                  StringLike:
+                    s3:prefix: !Sub "${StorePrefix}*"
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${StoreBucket}/${StorePrefix}*"
+
+  # --- Web Function ------------------------------------------------------------------------------------------------
+
+  WebFunction:
+    Type: AWS::Lambda::WebFunction
+    Properties:
+      FunctionName: !Ref FunctionName
+
+  # Immutable: a new CodeVersion (or any other change) creates a new revision, the endpoint moves to it, and the old
+  # one is deleted.
+  Revision:
+    Type: AWS::Lambda::WebFunctionRevision
+    Properties:
+      FunctionName: !Ref WebFunction
+      Description: !Sub "${CodeKey} ${CodeVersion}"
+      KmsKeyArn: !If [HasKmsKey, !Ref KmsKeyArn, !Ref AWS::NoValue]
+      BuildConfig:
+        CodeConfig:
+          S3Object:
+            Bucket: !Ref CodeBucket
+            Key: !Ref CodeKey
+            VersionId: !Ref CodeVersion
+        RuntimeConfig:
+          Runtime: nodejs24.x
+      ServiceConfig:
+        ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+        TimeoutSeconds: !Ref TimeoutSeconds
+        EnvironmentVariables:
+          NEXT_TELEMETRY_DISABLED: "1"
+          MIZAR_CONFIG_JSON: !Ref ConfigJson
+          MIZAR_STORE: !Sub "s3://${StoreBucket}/${StorePrefix}"
+          MIZAR_AUTH_MODE: !If [IsPublic, "none", !Ref AWS::NoValue]
+          MIZAR_AUTH_ISSUER: !If [HasOidc, !Ref OidcIssuer, !Ref AWS::NoValue]
+          MIZAR_AUTH_CLIENT_ID: !If [HasOidc, !Ref OidcClientId, !Ref AWS::NoValue]
+          MIZAR_AUTH_CLIENT_SECRET: !If
+            - HasClientSecret
+            - !Sub "{{resolve:secretsmanager:${ClientSecret}:SecretString}}"
+            - !Ref AWS::NoValue
+          MIZAR_AUTH_SAML_ENTRY_POINT: !If [HasSaml, !Ref SamlEntryPoint, !Ref AWS::NoValue]
+          MIZAR_AUTH_SAML_IDP_CERT: !If [HasSaml, !Ref SamlIdpCert, !Ref AWS::NoValue]
+          MIZAR_AUTH_SAML_IDP_ISSUER: !If [HasSamlIdpIssuer, !Ref SamlIdpIssuer, !Ref AWS::NoValue]
+          MIZAR_AUTH_PUBLIC_URL: !If [HasSignIn, !Sub "https://${DomainName}", !Ref AWS::NoValue]
+          MIZAR_AUTH_SESSION_SECRET: !If
+            - HasSignIn
+            - !Sub "{{resolve:secretsmanager:${SessionSecret}:SecretString}}"
+            - !Ref AWS::NoValue
+          MIZAR_AUTH_ALLOWED_EMAILS: !If [HasAllowedEmails, !Ref AllowedEmails, !Ref AWS::NoValue]
+          MIZAR_AUTH_ALLOWED_DOMAINS: !If [HasAllowedDomains, !Ref AllowedDomains, !Ref AWS::NoValue]
+          MIZAR_AUTH_ALLOWED_GROUPS: !If [HasAllowedGroups, !Ref AllowedGroups, !Ref AWS::NoValue]
+
+  # Publicly resolvable, but only signed requests that the resource policy allows get through.
+  Endpoint:
+    Type: AWS::Lambda::WebFunctionEndpoint
+    Properties:
+      FunctionName: !Ref WebFunction
+      EndpointName: prod
+      EndpointType: HomeRegion
+      AuthType: IamAuth
+      RevisionWeights:
+        - RevisionId: !GetAtt Revision.RevisionId
+          Weight: 100
+
+  # Only this distribution may invoke the endpoint.
+  ResourcePolicy:
+    Type: AWS::Lambda::ResourcePolicy
+    Properties:
+      ResourceArn: !GetAtt WebFunction.FunctionArn
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFront
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: lambda:InvokeWebFunctionEndpoint
+            Resource: !GetAtt Endpoint.EndpointArn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  # --- CloudFront --------------------------------------------------------------------------------------------------
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-${FunctionName}"
+        Description: Mizar Web Function endpoint
+        OriginAccessControlOriginType: lambda
+        # The only behavior Web Function origins accept.
+        SigningBehavior: always-amz-auth
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "Mizar (${AWS::StackName})"
+        Aliases: [!Ref DomainName]
+        HttpVersion: http2and3
+        WebACLId: !If [HasWebAcl, !Ref WebAclArn, !Ref AWS::NoValue]
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: web-function
+            DomainName: !GetAtt Endpoint.DomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: !Ref TimeoutSeconds
+        DefaultCacheBehavior:
+          TargetOriginId: web-function
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          Compress: true
+          # Managed policies: CachingDisabled; AllViewerExceptHostHeader (Lambda routes on its own Host).
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        CacheBehaviors:
+          # Hashed build assets: no infrastructure data, safe to cache (CachingOptimized).
+          - PathPattern: /_next/static/*
+            TargetOriginId: web-function
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2 # CloudFront
+
+  DnsRecordIpv6:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+Outputs:
+  Url:
+    Description: Mizar, once DNS points DomainName at the distribution.
+    Value: !Sub "https://${DomainName}"
+  RedirectUri:
+    Condition: HasOidc
+    Description: Register this redirect URI with your identity provider.
+    Value: !Sub "https://${DomainName}/auth/callback"
+  SamlAcsUrl:
+    Condition: HasSaml
+    Description: The application ACS URL to register with your SAML identity provider.
+    Value: !Sub "https://${DomainName}/auth/saml/acs"
+  SamlAudience:
+    Condition: HasSaml
+    Description: The application SAML audience (entity id) to register with your SAML identity provider.
+    Value: !Sub "https://${DomainName}"
+  DistributionDomainName:
+    Description: Point DomainName here (alias or CNAME) unless HostedZoneId was given.
+    Value: !GetAtt Distribution.DomainName
+  EndpointDomainName:
+    Description: The Web Function endpoint. It rejects requests that don't come through the distribution.
+    Value: !GetAtt Endpoint.DomainName
+  RevisionId:
+    Value: !GetAtt Revision.RevisionId
+  Logs:
+    Value: !Ref LogGroup

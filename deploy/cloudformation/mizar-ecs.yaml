@@ -1,0 +1,525 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Mizar on ECS Fargate: a web service behind an internal HTTPS load balancer with OpenID Connect or SAML (IAM
+  Identity Center) sign-in, and a collector task run on a schedule, sharing snapshots in a private S3 bucket. Deploy mizar-collector-role.yaml
+  (ComputeService ecs-tasks.amazonaws.com) first.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Mizar }
+        Parameters: [ImageUri, CpuArchitecture, ConfigJson, CollectEveryMinutes, CollectorRoleArn]
+      - Label: { default: Network }
+        Parameters: [VpcId, TaskSubnetIds, LoadBalancerSubnetIds, AllowedCidr]
+      - Label: { default: Address }
+        Parameters: [DomainName, CertificateArn, HostedZoneId]
+      - Label: { default: Sign-in (OpenID Connect) }
+        Parameters: [OidcIssuer, OidcClientId, OidcClientSecret]
+      - Label: { default: Sign-in (SAML, e.g. IAM Identity Center) }
+        Parameters: [SamlEntryPoint, SamlIdpCert, SamlIdpIssuer]
+      - Label: { default: Who may sign in }
+        Parameters: [AllowedEmails, AllowedDomains, AllowedGroups]
+      - Label: { default: Operations }
+        Parameters: [LogRetentionDays]
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: Mizar image, e.g. 123456789012.dkr.ecr.eu-west-1.amazonaws.com/mizar:0.1.0 (see README).
+  CpuArchitecture:
+    Type: String
+    Default: ARM64
+    AllowedValues: [ARM64, X86_64]
+    Description: Architecture the image was built for (Graviton ARM64 is cheaper).
+  ConfigJson:
+    Type: String
+    Default: '{"source": "aws"}'
+    Description: >-
+      mizar.config.json contents (collector scope, regions, inventory, ...). No secrets: it is visible in the
+      task definitions. Store, sign-in and region are set by this template.
+  CollectEveryMinutes:
+    Type: Number
+    Default: 60
+    MinValue: 5
+    Description: Minutes between collections. Each one runs as a separate task that stops when it is done.
+  CollectorRoleArn:
+    Type: String
+    AllowedPattern: "^arn:aws[a-z-]*:iam::\\d{12}:role/.+$"
+    Description: RoleArn output of mizar-collector-role.yaml, deployed with ComputeService ecs-tasks.amazonaws.com.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  TaskSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >-
+      Private subnets for the tasks. They need outbound HTTPS to AWS APIs, the image registry and your identity
+      provider (NAT gateway, or VPC endpoints plus a route to the provider).
+  LoadBalancerSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets in at least two Availability Zones for the internal load balancer.
+  AllowedCidr:
+    Type: String
+    AllowedPattern: "^\\d{1,3}(\\.\\d{1,3}){3}/\\d{1,2}$"
+    Description: Network allowed to reach the load balancer on 443, e.g. your VPN or corporate range.
+  DomainName:
+    Type: String
+    Description: Host name users open, e.g. mizar.internal.example.com. Covered by CertificateArn.
+  CertificateArn:
+    Type: String
+    Description: ACM certificate for DomainName, in this region.
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: Optional Route 53 hosted zone to create DomainName in. Empty to point DNS at the load balancer yourself.
+  OidcIssuer:
+    Type: String
+    Default: ""
+    Description: >-
+      OpenID Connect issuer URL. Register the redirect URI https://<DomainName>/auth/callback there. Set this or
+      SamlEntryPoint.
+  OidcClientId:
+    Type: String
+    Default: ""
+  OidcClientSecret:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Client secret, kept in Secrets Manager. Empty for a public client.
+  SamlEntryPoint:
+    Type: String
+    Default: ""
+    Description: >-
+      SAML identity provider sign-in URL (IAM Identity Center: "IAM Identity Center sign-in URL"). Register the ACS URL
+      https://<DomainName>/auth/saml/acs and audience https://<DomainName> there. Set this or OidcIssuer.
+  SamlIdpCert:
+    Type: String
+    Default: ""
+    Description: >-
+      The provider's signing certificate: the base64 between its BEGIN and END lines, on one line.
+  SamlIdpIssuer:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional issuer the provider's responses must name (IAM Identity Center: "IAM Identity Center issuer URL").
+  AllowedEmails:
+    Type: String
+    Default: ""
+    Description: Optional comma-separated emails allowed to sign in.
+  AllowedDomains:
+    Type: String
+    Default: ""
+    Description: Optional comma-separated email domains allowed to sign in.
+  AllowedGroups:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional comma-separated groups (the ID token's "groups" claim, or a SAML attribute named "groups") allowed to
+      sign in.
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+Rules:
+  OneSignIn:
+    Assertions:
+      - Assert: !Or [!Not [!Equals [!Ref OidcIssuer, ""]], !Not [!Equals [!Ref SamlEntryPoint, ""]]]
+        AssertDescription: Set OidcIssuer (OpenID Connect) or SamlEntryPoint (SAML).
+      - Assert: !Or [!Equals [!Ref OidcIssuer, ""], !Equals [!Ref SamlEntryPoint, ""]]
+        AssertDescription: Set OidcIssuer or SamlEntryPoint, not both.
+      - Assert: !Or [!Equals [!Ref OidcIssuer, ""], !Not [!Equals [!Ref OidcClientId, ""]]]
+        AssertDescription: OpenID Connect sign-in needs OidcClientId.
+      - Assert: !Or [!Equals [!Ref SamlEntryPoint, ""], !Not [!Equals [!Ref SamlIdpCert, ""]]]
+        AssertDescription: SAML sign-in needs SamlIdpCert.
+
+Conditions:
+  HasOidc: !Not [!Equals [!Ref OidcIssuer, ""]]
+  HasSaml: !Not [!Equals [!Ref SamlEntryPoint, ""]]
+  HasClientSecret: !Not [!Equals [!Ref OidcClientSecret, ""]]
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, ""]]
+
+Resources:
+  # --- Snapshots ---------------------------------------------------------------------------------------------------
+
+  SnapshotBucket:
+    Type: AWS::S3::Bucket
+    # Snapshots map the whole estate: keep them if the stack goes, delete the bucket deliberately.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 }
+
+  # Same-account grants: the collector role needs no S3 permissions of its own for this bucket.
+  SnapshotBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SnapshotBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt SnapshotBucket.Arn, !Sub "${SnapshotBucket.Arn}/*"]
+            Condition: { Bool: { aws:SecureTransport: "false" } }
+          - Sid: ListSnapshots
+            Effect: Allow
+            Principal: { AWS: [!Ref CollectorRoleArn, !GetAtt WebTaskRole.Arn] }
+            Action: s3:ListBucket
+            Resource: !GetAtt SnapshotBucket.Arn
+            Condition: { StringLike: { s3:prefix: "snapshots/*" } }
+          - Sid: ReadSnapshots
+            Effect: Allow
+            Principal: { AWS: [!Ref CollectorRoleArn, !GetAtt WebTaskRole.Arn] }
+            Action: s3:GetObject
+            Resource: !Sub "${SnapshotBucket.Arn}/snapshots/*"
+          - Sid: WriteSnapshots
+            Effect: Allow
+            Principal: { AWS: !Ref CollectorRoleArn }
+            Action: [s3:PutObject, s3:DeleteObject]
+            Resource: !Sub "${SnapshotBucket.Arn}/snapshots/*"
+
+  # --- Secrets -----------------------------------------------------------------------------------------------------
+
+  SessionSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Mizar session cookie encryption key
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  ClientSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: HasClientSecret
+    Properties:
+      Description: Mizar OpenID Connect client secret
+      SecretString: !Ref OidcClientSecret
+
+  # --- Roles -------------------------------------------------------------------------------------------------------
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Mizar ECS task execution (image pull, logs, secrets)
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { aws:SourceAccount: !Ref AWS::AccountId } }
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - PolicyName: MizarSecrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !If [HasClientSecret, [!Ref SessionSecret, !Ref ClientSecret], [!Ref SessionSecret]]
+
+  # The web app only reads snapshots (granted by the bucket policy).
+  WebTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Mizar web app (reads snapshots)
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { aws:SourceAccount: !Ref AWS::AccountId } }
+
+  # --- Network -----------------------------------------------------------------------------------------------------
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Mizar load balancer - HTTPS from the allowed network
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref AllowedCidr, Description: Users }
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Mizar web tasks - port 3000 from the load balancer only
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: AWS APIs and the identity provider }
+
+  CollectorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Mizar collector tasks - no inbound access
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: AWS APIs }
+
+  WebFromLoadBalancer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WebSecurityGroup
+      SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      Description: Load balancer
+
+  LoadBalancerToWeb:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LoadBalancerSecurityGroup
+      DestinationSecurityGroupId: !Ref WebSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      Description: Web tasks
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internal
+      Subnets: !Ref LoadBalancerSubnetIds
+      SecurityGroups: [!Ref LoadBalancerSecurityGroup]
+      LoadBalancerAttributes:
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: "true" }
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      TargetType: ip
+      Protocol: HTTP
+      Port: 3000
+      HealthCheckPath: /healthz
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTPS
+      Port: 443
+      Certificates: [{ CertificateArn: !Ref CertificateArn }]
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref TargetGroup }
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+
+  # --- Tasks and services ------------------------------------------------------------------------------------------
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/mizar/${AWS::StackName}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+
+  WebTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-web"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      RuntimePlatform: { CpuArchitecture: !Ref CpuArchitecture, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt WebTaskRole.Arn
+      ContainerDefinitions:
+        - Name: web
+          Image: !Ref ImageUri
+          Command: [serve]
+          Essential: true
+          PortMappings: [{ ContainerPort: 3000, Protocol: tcp }]
+          Environment:
+            - { Name: MIZAR_CONFIG_JSON, Value: !Ref ConfigJson }
+            - { Name: MIZAR_STORE, Value: !Sub "s3://${SnapshotBucket}/snapshots" }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: MIZAR_AUTH_ISSUER, Value: !Ref OidcIssuer }
+            - { Name: MIZAR_AUTH_CLIENT_ID, Value: !Ref OidcClientId }
+            - { Name: MIZAR_AUTH_SAML_ENTRY_POINT, Value: !Ref SamlEntryPoint }
+            - { Name: MIZAR_AUTH_SAML_IDP_CERT, Value: !Ref SamlIdpCert }
+            - { Name: MIZAR_AUTH_SAML_IDP_ISSUER, Value: !Ref SamlIdpIssuer }
+            - { Name: MIZAR_AUTH_PUBLIC_URL, Value: !Sub "https://${DomainName}" }
+            - { Name: MIZAR_AUTH_ALLOWED_EMAILS, Value: !Ref AllowedEmails }
+            - { Name: MIZAR_AUTH_ALLOWED_DOMAINS, Value: !Ref AllowedDomains }
+            - { Name: MIZAR_AUTH_ALLOWED_GROUPS, Value: !Ref AllowedGroups }
+          Secrets:
+            - { Name: MIZAR_AUTH_SESSION_SECRET, ValueFrom: !Ref SessionSecret }
+            - !If
+              - HasClientSecret
+              - { Name: MIZAR_AUTH_CLIENT_SECRET, ValueFrom: !Ref ClientSecret }
+              - !Ref AWS::NoValue
+          HealthCheck:
+            Command: [CMD-SHELL, "wget -qO- http://127.0.0.1:3000/healthz >/dev/null || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 20
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: web
+
+  CollectorTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-collector"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "2048"
+      RuntimePlatform: { CpuArchitecture: !Ref CpuArchitecture, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !Ref CollectorRoleArn
+      ContainerDefinitions:
+        - Name: collector
+          Image: !Ref ImageUri
+          Command: [collect]
+          Essential: true
+          Environment:
+            - { Name: MIZAR_CONFIG_JSON, Value: !Ref ConfigJson }
+            - { Name: MIZAR_STORE, Value: !Sub "s3://${SnapshotBucket}/snapshots" }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: collector
+
+  WebService:
+    Type: AWS::ECS::Service
+    DependsOn: [HttpsListener]
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref WebTaskDefinition
+      DesiredCount: 1
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref TaskSubnetIds
+          SecurityGroups: [!Ref WebSecurityGroup]
+      LoadBalancers:
+        - { ContainerName: web, ContainerPort: 3000, TargetGroupArn: !Ref TargetGroup }
+
+  # The collector only runs while it collects: one task per run, started by EventBridge Scheduler. A run that outlasts
+  # the interval may overlap the next; the store's conditional writes keep both snapshots intact.
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Mizar collector schedule (starts the collector task)
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { aws:SourceAccount: !Ref AWS::AccountId } }
+      Policies:
+        - PolicyName: RunCollector
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${AWS::StackName}-collector:*"
+                Condition: { ArnEquals: { ecs:cluster: !GetAtt Cluster.Arn } }
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt ExecutionRole.Arn, !Ref CollectorRoleArn]
+                Condition: { StringEquals: { iam:PassedToService: ecs-tasks.amazonaws.com } }
+
+  CollectorSchedule:
+    Type: AWS::Scheduler::Schedule
+    DependsOn: [SnapshotBucketPolicy]
+    Properties:
+      Description: !Sub "Mizar collection (${AWS::StackName})"
+      ScheduleExpression: !Sub "rate(${CollectEveryMinutes} minutes)"
+      FlexibleTimeWindow: { Mode: "OFF" }
+      State: ENABLED
+      Target:
+        Arn: !GetAtt Cluster.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        RetryPolicy: { MaximumRetryAttempts: 3, MaximumEventAgeInSeconds: 600 }
+        EcsParameters:
+          TaskDefinitionArn: !Ref CollectorTaskDefinition
+          LaunchType: FARGATE
+          PlatformVersion: LATEST
+          TaskCount: 1
+          NetworkConfiguration:
+            AwsvpcConfiguration:
+              AssignPublicIp: DISABLED
+              Subnets: !Ref TaskSubnetIds
+              SecurityGroups: [!Ref CollectorSecurityGroup]
+
+Outputs:
+  Url:
+    Description: Mizar, once DNS points DomainName at the load balancer.
+    Value: !Sub "https://${DomainName}"
+  RedirectUri:
+    Condition: HasOidc
+    Description: Register this redirect URI with your identity provider.
+    Value: !Sub "https://${DomainName}/auth/callback"
+  SamlAcsUrl:
+    Condition: HasSaml
+    Description: The application ACS URL to register with your SAML identity provider.
+    Value: !Sub "https://${DomainName}/auth/saml/acs"
+  SamlAudience:
+    Condition: HasSaml
+    Description: The application SAML audience (entity id) to register with your SAML identity provider.
+    Value: !Sub "https://${DomainName}"
+  LoadBalancerDnsName:
+    Description: Point DomainName here (alias or CNAME) unless HostedZoneId was given.
+    Value: !GetAtt LoadBalancer.DNSName
+  SnapshotBucket:
+    Value: !Ref SnapshotBucket
+  Logs:
+    Value: !Ref LogGroup
+  RunCollectorNow:
+    Description: Collect now instead of waiting for the schedule (e.g. right after creating the stack).
+    Value: !Sub
+      - >-
+        aws ecs run-task --cluster ${Cluster} --task-definition ${CollectorTaskDefinition} --launch-type FARGATE
+        --network-configuration "awsvpcConfiguration={subnets=[${Subnets}],securityGroups=[${CollectorSecurityGroup}],assignPublicIp=DISABLED}"
+      - Subnets: !Join [",", !Ref TaskSubnetIds]

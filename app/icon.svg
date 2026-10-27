@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Mizar app icon">
+  <rect width="512" height="512" rx="112" fill="#0A0F1F"/>
+  <g transform="translate(56 56) scale(2)">
+    <polyline points="22,128 100,96 176,124" fill="none" stroke="#3A4566" stroke-width="2.5" stroke-linejoin="round"/>
+    <circle cx="22" cy="128" r="6" fill="#FFFFFF"/>
+    <circle cx="176" cy="124" r="7" fill="#FFFFFF"/>
+    <circle cx="100" cy="96" r="54" fill="#0A0F1F"/>
+    <circle cx="100" cy="96" r="54" fill="none" stroke="#F2C14E" stroke-width="1.5" opacity="0.45"/>
+    <path d="M100,56 C103.5,84.2 111.8,92.5 140,96 C111.8,99.5 103.5,107.8 100,136 C96.5,107.8 88.2,99.5 60,96 C88.2,92.5 96.5,84.2 100,56 Z" fill="#F2C14E"/>
+    <circle cx="146" cy="50" r="6" fill="#F2C14E"/>
+  </g>
+</svg>

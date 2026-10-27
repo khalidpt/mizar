@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Mizar on one private EC2 instance: the web app and the collector run as Docker containers under systemd, with
+  snapshots on the instance's encrypted volume. No inbound ports: open it through Systems Manager port forwarding.
+  Deploy mizar-collector-role.yaml (ComputeService ec2.amazonaws.com) first.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Mizar }
+        Parameters: [ImageUri, ConfigJson, CollectEveryMinutes]
+      - Label: { default: Instance }
+        Parameters: [SubnetId, VpcId, InstanceProfileName, InstanceType, LatestAmiId, VolumeSize]
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: Mizar image, e.g. 123456789012.dkr.ecr.eu-west-1.amazonaws.com/mizar:0.1.0 (see README).
+  ConfigJson:
+    Type: String
+    Default: '{"source": "aws"}'
+    Description: >-
+      mizar.config.json contents (collector scope, regions, inventory, ...). No secrets: it is stored in the
+      instance user data.
+  CollectEveryMinutes:
+    Type: Number
+    Default: 60
+    MinValue: 5
+    Description: Minutes between collections.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC of the subnet.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      Private subnet. Needs outbound HTTPS to AWS APIs (NAT gateway, or VPC endpoints for SSM, ECR, S3, STS and
+      the collected services).
+  InstanceProfileName:
+    Type: String
+    Default: MizarCollector
+    Description: Instance profile from mizar-collector-role.yaml (named after its role).
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    Description: Graviton (arm64) by default; for x86 pick e.g. t3.small and an x86_64 LatestAmiId and image.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Amazon Linux 2023 AMI, resolved at deploy time.
+  VolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 8
+    Description: Root volume in GiB (images plus snapshots).
+
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Mizar instance - no inbound access (Systems Manager only)
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - Description: HTTPS to AWS APIs and the image registry
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: mizar
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: !Ref InstanceProfileName
+        SecurityGroupIds: [!Ref SecurityGroup]
+        # IMDSv2 only; hop limit 2 so the containers can reach it.
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: !Ref VolumeSize
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: mizar
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            dnf install -y docker
+            systemctl enable --now docker
+
+            install -d -m 755 /etc/mizar
+            install -d -m 700 -o 1000 -g 1000 /var/lib/mizar/data
+            echo '${ImageUri}' > /etc/mizar/image
+            cat > /etc/mizar/mizar.config.json <<'JSON'
+            ${ConfigJson}
+            JSON
+
+            # Logs in to ECR when the image lives there, then pulls; runs before every (re)start.
+            cat > /usr/local/bin/mizar-pull <<'SH'
+            #!/bin/sh
+            set -e
+            IMAGE=$(cat /etc/mizar/image)
+            REGISTRY=${!IMAGE%%/*}
+            case "$REGISTRY" in
+              *.dkr.ecr.*.amazonaws.com)
+                aws ecr get-login-password --region "$(echo "$REGISTRY" | cut -d. -f4)" |
+                  docker login --username AWS --password-stdin "$REGISTRY" ;;
+            esac
+            docker pull "$IMAGE"
+            SH
+            chmod 755 /usr/local/bin/mizar-pull
+
+            # Host networking: the web app listens on the instance's 127.0.0.1:3000 (no sign-in configured), where
+            # Systems Manager port forwarding arrives.
+            for role in web collect; do
+              if [ "$role" = web ]; then args="serve"; else args="collect --every ${CollectEveryMinutes}"; fi
+              cat > /etc/systemd/system/mizar-$role.service <<UNIT
+            [Unit]
+            Description=Mizar $role
+            After=docker.service network-online.target
+            Requires=docker.service
+
+            [Service]
+            Restart=always
+            RestartSec=10
+            ExecStartPre=-/usr/bin/docker rm -f mizar-$role
+            ExecStartPre=/usr/local/bin/mizar-pull
+            ExecStart=/usr/bin/docker run --rm --name mizar-$role --network host -e AWS_REGION=${AWS::Region} -v /var/lib/mizar/data:/app/data -v /etc/mizar/mizar.config.json:/app/mizar.config.json:ro ${ImageUri} $args
+            ExecStop=/usr/bin/docker stop mizar-$role
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            done
+            systemctl daemon-reload
+            systemctl enable --now mizar-collect mizar-web
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      SubnetId: !Ref SubnetId
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  OpenMizar:
+    Description: Run this, then open http://localhost:3000
+    Value: !Sub >-
+      aws ssm start-session --region ${AWS::Region} --target ${Instance}
+      --document-name AWS-StartPortForwardingSession --parameters portNumber=3000,localPortNumber=3000

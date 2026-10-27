@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Mizar read-only role for one collected account. Deploy it to every member account with a service-managed
+  StackSet, and as a plain stack in the management account if you want that mapped too. Lists and describes
+  infrastructure only: no object contents, queue messages, table items or secrets.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Who may assume this role }
+        Parameters: [CollectorAccountId, CollectorRoleName, CollectorRolePath, ExternalId]
+      - Label: { default: This role }
+        Parameters: [RoleName, RolePath]
+
+Parameters:
+  CollectorAccountId:
+    Type: String
+    AllowedPattern: "^\\d{12}$"
+    Description: Account where the Mizar collector runs (the hosting account).
+  CollectorRoleName:
+    Type: String
+    Default: MizarCollector
+    Description: Name of the collector's role in that account (mizar-collector-role.yaml).
+  CollectorRolePath:
+    Type: String
+    Default: /
+    AllowedPattern: "^/(.*/)?$"
+    Description: IAM path of the collector's role.
+  RoleName:
+    Type: String
+    Default: MizarReadOnly
+    Description: Name of this role; must match the collector's aws.roleName setting.
+  RolePath:
+    Type: String
+    Default: /
+    AllowedPattern: "^/(.*/)?$"
+    Description: IAM path of this role; must match the collector's aws.rolePath setting.
+  ExternalId:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Optional external id the collector must present (its aws.externalId setting). Empty for none.
+
+Conditions:
+  HasExternalId: !Not [!Equals [!Ref ExternalId, ""]]
+
+Resources:
+  ReadOnlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Path: !Ref RolePath
+      Description: Mizar collector read-only access (infrastructure inventory only)
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # The account as principal plus a PrincipalArn condition: only the collector role may assume this role,
+          # and the stacks can be created in any order (a role ARN principal must already exist).
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${CollectorAccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              ArnEquals:
+                aws:PrincipalArn: !Sub "arn:${AWS::Partition}:iam::${CollectorAccountId}:role${CollectorRolePath}${CollectorRoleName}"
+              StringEquals: !If
+                - HasExternalId
+                - sts:ExternalId: !Ref ExternalId
+                - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: MizarInventory
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeRegions
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeInternetGateways
+                  - ec2:DescribeNatGateways
+                  - ec2:DescribeTransitGateways
+                  - ec2:DescribeTransitGatewayVpcAttachments
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeVpcPeeringConnections
+                  - ec2:DescribeVpnGateways
+                  - ec2:DescribeVpnConnections
+                  - ec2:DescribeCustomerGateways
+                  - ec2:DescribeInstances
+                  - ec2:DescribeSecurityGroups
+                  - network-firewall:ListFirewalls
+                  - network-firewall:DescribeFirewall
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - ecs:ListClusters
+                  - ecs:ListServices
+                  - ecs:DescribeServices
+                  - eks:ListClusters
+                  - eks:DescribeCluster
+                  - lambda:ListFunctions
+                  - lambda:ListEventSourceMappings
+                  - rds:DescribeDBInstances
+                  - elasticache:DescribeReplicationGroups
+                  - elasticache:DescribeCacheClusters
+                  - elasticache:DescribeCacheSubnetGroups
+                  - elasticache:DescribeServerlessCaches
+                  - workspaces:DescribeWorkspaceDirectories
+                  - workspaces:DescribeWorkspaces
+                  - dynamodb:ListTables
+                  - dynamodb:DescribeTable
+                  - sqs:ListQueues
+                  - s3:ListAllMyBuckets
+                  - cloudfront:ListDistributions
+                  - cloudwatch:DescribeAlarms
+                  - iam:ListAccountAliases
+                Resource: "*"
+              # API Gateway reads are one action scoped by path: API lists, REST methods and integrations, HTTP API
+              # integrations and VPC links only (never API keys, stage variables or exports).
+              - Effect: Allow
+                Action:
+                  - apigateway:GET
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:apigateway:*::/restapis"
+                  - !Sub "arn:${AWS::Partition}:apigateway:*::/restapis/*/resources"
+                  - !Sub "arn:${AWS::Partition}:apigateway:*::/apis"
+                  - !Sub "arn:${AWS::Partition}:apigateway:*::/apis/*/integrations"
+                  - !Sub "arn:${AWS::Partition}:apigateway:*::/vpclinks"
+      Tags:
+        - Key: mizar:component
+          Value: member-role
+
+Outputs:
+  RoleArn:
+    Description: Role the collector assumes in this account.
+    Value: !GetAtt ReadOnlyRole.Arn

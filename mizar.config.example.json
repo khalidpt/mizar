@@ -1,0 +1,17 @@
+{
+  "store": "file://./data/snapshots",
+  "retain": 48,
+  "source": "mock",
+  "mock": { "seed": 42, "teams": 4, "sandboxes": 2 },
+  "aws": {
+    "scope": "organization",
+    "accounts": [],
+    "excludeAccounts": [],
+    "regions": [],
+    "roleName": "MizarReadOnly",
+    "inventory": "direct",
+    "enrich": true,
+    "cost": { "enabled": false, "metric": "UnblendedCost" },
+    "concurrency": { "accounts": 4, "regions": 4 }
+  }
+}

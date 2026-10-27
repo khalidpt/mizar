@@ -1,0 +1,270 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Mizar collector role for the hosting account (where Mizar runs): reads the AWS Organization, the AWS Config
+  aggregator and this account's own inventory, assumes the read-only member role everywhere else, and optionally
+  reads and writes snapshots in an S3 bucket. Read-only towards your infrastructure.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Where Mizar runs }
+        Parameters: [ComputeService]
+      - Label: { default: Roles }
+        Parameters: [RoleName, RolePath, MemberRoleName, MemberRolePath]
+      - Label: { default: Snapshot store (optional) }
+        Parameters: [StoreBucket, StorePrefix]
+      - Label: { default: Costs (optional) }
+        Parameters: [CostAccountId, CostRoleName, CostRolePath]
+
+Parameters:
+  ComputeService:
+    Type: String
+    Default: ec2.amazonaws.com
+    AllowedValues: [ec2.amazonaws.com, ecs-tasks.amazonaws.com, pods.eks.amazonaws.com]
+    Description: >-
+      What runs Mizar: an EC2 instance (an instance profile is created, with SSM management and pulls from this
+      account's ECR repositories), an ECS task (task role) or an EKS pod (EKS Pod Identity).
+  RoleName:
+    Type: String
+    Default: MizarCollector
+    Description: Name of this role; member roles trust it by name (mizar-member-role.yaml CollectorRoleName).
+  RolePath:
+    Type: String
+    Default: /
+    AllowedPattern: "^/(.*/)?$"
+    Description: IAM path of this role.
+  MemberRoleName:
+    Type: String
+    Default: MizarReadOnly
+    Description: Read-only role in each collected account (the collector's aws.roleName setting).
+  MemberRolePath:
+    Type: String
+    Default: /
+    AllowedPattern: "^/(.*/)?$"
+    Description: IAM path of that role (the collector's aws.rolePath setting).
+  StoreBucket:
+    Type: String
+    Default: ""
+    AllowedPattern: "^([a-z0-9][a-z0-9.-]{1,61}[a-z0-9])?$"
+    Description: Bucket of an s3:// snapshot store. Empty when snapshots are kept on disk (file://).
+  StorePrefix:
+    Type: String
+    Default: mizar/
+    AllowedPattern: "^([^/].*/)?$"
+    Description: >-
+      Key prefix of the store, with a trailing slash: s3://my-bucket/mizar → "mizar/". Empty for the whole
+      bucket.
+
+  CostAccountId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^(\\d{12})?$"
+    Description: >-
+      Account the collector reads Cost Explorer spend from (aws.cost), normally the management account. This
+      account: Cost Explorer is allowed here directly. Another account: the cost role there may be assumed
+      (mizar-cost-role.yaml). Empty: no cost reading.
+  CostRoleName:
+    Type: String
+    Default: MizarCostReader
+    Description: Cost reader role in that account (the collector's aws.cost.roleName setting).
+  CostRolePath:
+    Type: String
+    Default: /
+    AllowedPattern: "^/(.*/)?$"
+    Description: IAM path of that role (the collector's aws.cost.rolePath setting).
+
+Conditions:
+  OnEc2: !Equals [!Ref ComputeService, ec2.amazonaws.com]
+  OnEcs: !Equals [!Ref ComputeService, ecs-tasks.amazonaws.com]
+  OnEks: !Equals [!Ref ComputeService, pods.eks.amazonaws.com]
+  HasStore: !Not [!Equals [!Ref StoreBucket, ""]]
+  HasCost: !Not [!Equals [!Ref CostAccountId, ""]]
+  CostHere: !Equals [!Ref CostAccountId, !Ref AWS::AccountId]
+  CostElsewhere: !And [!Condition HasCost, !Not [!Condition CostHere]]
+
+Resources:
+  CollectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Path: !Ref RolePath
+      Description: Mizar collector (read-only inventory across the organization)
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Ref ComputeService
+            # EKS Pod Identity also tags the session.
+            Action: !If [OnEks, [sts:AssumeRole, sts:TagSession], sts:AssumeRole]
+            # ECS tasks: only tasks in this account (confused-deputy protection).
+            Condition: !If
+              - OnEcs
+              - StringEquals:
+                  aws:SourceAccount: !Ref AWS::AccountId
+              - !Ref AWS::NoValue
+      # EC2 (mizar-ec2.yaml): reachable through Systems Manager (port forwarding) instead of open ports.
+      ManagedPolicyArns: !If
+        - OnEc2
+        - [!Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"]
+        - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: MizarAssumeMemberRoles
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::*:role${MemberRolePath}${MemberRoleName}"
+        - PolicyName: MizarOrganization
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Organization structure (scope "organization", and OU paths otherwise). From a delegated administrator
+              # account, the management account must also allow these in the Organizations delegation policy.
+              - Effect: Allow
+                Action:
+                  - organizations:DescribeOrganization
+                  - organizations:ListRoots
+                  - organizations:ListOrganizationalUnitsForParent
+                  - organizations:ListAccountsForParent
+                  - organizations:ListTagsForResource
+                Resource: "*"
+              # aws.inventory "config": one query against the aggregator, plus which accounts it doesn't cover.
+              - Effect: Allow
+                Action:
+                  - config:SelectAggregateResourceConfig
+                  - config:DescribeConfigurationAggregatorSourcesStatus
+                Resource: "*"
+        # This account is collected with this role's own credentials, so it needs the member role's reads too.
+        - PolicyName: MizarInventory
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeRegions
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeInternetGateways
+                  - ec2:DescribeNatGateways
+                  - ec2:DescribeTransitGateways
+                  - ec2:DescribeTransitGatewayVpcAttachments
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeVpcPeeringConnections
+                  - ec2:DescribeVpnGateways
+                  - ec2:DescribeVpnConnections
+                  - ec2:DescribeCustomerGateways
+                  - ec2:DescribeInstances
+                  - ec2:DescribeSecurityGroups
+                  - network-firewall:ListFirewalls
+                  - network-firewall:DescribeFirewall
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - ecs:ListClusters
+                  - ecs:ListServices
+                  - ecs:DescribeServices
+                  - eks:ListClusters
+                  - eks:DescribeCluster
+                  - lambda:ListFunctions
+                  - lambda:ListEventSourceMappings
+                  - rds:DescribeDBInstances
+                  - elasticache:DescribeReplicationGroups
+                  - elasticache:DescribeCacheClusters
+                  - elasticache:DescribeCacheSubnetGroups
+                  - elasticache:DescribeServerlessCaches
+                  - workspaces:DescribeWorkspaceDirectories
+                  - workspaces:DescribeWorkspaces
+                  - dynamodb:ListTables
+                  - dynamodb:DescribeTable
+                  - sqs:ListQueues
+                  - s3:ListAllMyBuckets
+                  - cloudfront:ListDistributions
+                  - cloudwatch:DescribeAlarms
+                  - iam:ListAccountAliases
+                Resource: "*"
+              # API Gateway reads are one action scoped by path: API lists, REST methods and integrations, HTTP API
+              # integrations and VPC links only (never API keys, stage variables or exports).
+              - Effect: Allow
+                Action:
+                  - apigateway:GET
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:apigateway:*::/restapis"
+                  - !Sub "arn:${AWS::Partition}:apigateway:*::/restapis/*/resources"
+                  - !Sub "arn:${AWS::Partition}:apigateway:*::/apis"
+                  - !Sub "arn:${AWS::Partition}:apigateway:*::/apis/*/integrations"
+                  - !Sub "arn:${AWS::Partition}:apigateway:*::/vpclinks"
+        # aws.cost: Cost Explorer in this account directly, or the cost reader role in another one.
+        - !If
+          - CostHere
+          - PolicyName: MizarCost
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - ce:GetCostAndUsage
+                  Resource: "*"
+          - !Ref AWS::NoValue
+        - !If
+          - CostElsewhere
+          - PolicyName: MizarAssumeCostReader
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: sts:AssumeRole
+                  Resource: !Sub "arn:${AWS::Partition}:iam::${CostAccountId}:role${CostRolePath}${CostRoleName}"
+          - !Ref AWS::NoValue
+        # EC2 runs the Mizar image itself (on ECS the task execution role pulls it).
+        - !If
+          - OnEc2
+          - PolicyName: MizarPullImage
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: ecr:GetAuthorizationToken
+                  Resource: "*"
+                - Effect: Allow
+                  Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability]
+                  Resource: !Sub "arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*"
+          - !Ref AWS::NoValue
+        - !If
+          - HasStore
+          - PolicyName: MizarSnapshotStore
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: s3:ListBucket
+                  Resource: !Sub "arn:${AWS::Partition}:s3:::${StoreBucket}"
+                  Condition:
+                    StringLike:
+                      s3:prefix: !Sub "${StorePrefix}*"
+                # Delete only for retention pruning.
+                - Effect: Allow
+                  Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                  Resource: !Sub "arn:${AWS::Partition}:s3:::${StoreBucket}/${StorePrefix}*"
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: mizar:component
+          Value: collector-role
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: OnEc2
+    Properties:
+      InstanceProfileName: !Ref RoleName
+      Path: !Ref RolePath
+      Roles: [!Ref CollectorRole]
+
+Outputs:
+  RoleArn:
+    Description: Collector role; use it as the ECS task role, EKS Pod Identity role or (via the profile) EC2 role.
+    Value: !GetAtt CollectorRole.Arn
+  InstanceProfileArn:
+    Condition: OnEc2
+    Description: Instance profile for the EC2 instance running Mizar.
+    Value: !GetAtt InstanceProfile.Arn

@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Mizar infrastructure snapshot (InfraGraph v1)",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "number",
+      "const": 1
+    },
+    "source": {
+      "type": "string",
+      "enum": [
+        "mock",
+        "aws"
+      ],
+      "description": "Collector that produced the snapshot."
+    },
+    "generatedAt": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$",
+      "description": "When the snapshot was collected (ISO 8601, UTC)."
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/GraphNode"
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/GraphEdge"
+      }
+    }
+  },
+  "required": [
+    "version",
+    "source",
+    "generatedAt",
+    "nodes",
+    "edges"
+  ],
+  "additionalProperties": false,
+  "description": "One infrastructure snapshot. Beyond this schema: node and edge ids are unique, exactly one node has no parentId, and every parentId, from and to names an existing node.",
+  "$defs": {
+    "GraphNode": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "ARN where AWS has one; otherwise a stable synthetic id (OU, region `region/<accountId>/<region>`, organization root). Unique."
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "organization",
+            "ou",
+            "account",
+            "region",
+            "vpc",
+            "subnet",
+            "igw",
+            "nat-gateway",
+            "tgw",
+            "vpn-gateway",
+            "vpn-connection",
+            "network-firewall",
+            "cloudfront",
+            "api-gateway",
+            "ec2",
+            "ecs-service",
+            "eks-cluster",
+            "lambda",
+            "elb",
+            "workspaces",
+            "rds",
+            "elasticache",
+            "dynamodb",
+            "s3",
+            "sqs"
+          ],
+          "description": "What the node is. Organization structure: organization, ou, account, region. Everything else is a resource or network component."
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name."
+        },
+        "parentId": {
+          "description": "Containment parent (organization → OU → account → region → VPC → subnet → resource). Absent only on the single root.",
+          "type": "string",
+          "minLength": 1
+        },
+        "accountId": {
+          "description": "Owning account. Absent on organization and OU nodes.",
+          "type": "string",
+          "pattern": "^\\d{12}$"
+        },
+        "region": {
+          "type": "string",
+          "minLength": 1
+        },
+        "az": {
+          "description": "Subnets only: their Availability Zone.",
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "warning",
+            "critical",
+            "stopped"
+          ]
+        },
+        "tags": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "meta": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number",
+              "boolean"
+            ]
+          },
+          "description": "Type-specific attributes (cidr, instanceType, engine, ...). Display only."
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "name",
+        "status",
+        "tags",
+        "meta"
+      ],
+      "additionalProperties": false,
+      "description": "A node. Containment is expressed only through parentId."
+    },
+    "GraphEdge": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "routes",
+            "peering",
+            "tgw-attachment",
+            "vpn",
+            "targets",
+            "invokes",
+            "connects"
+          ],
+          "description": "routes: subnet route table → IGW / NAT gateway / TGW / virtual private gateway / Network Firewall endpoint, or gateway route table (ingress routing) → firewall endpoint. peering: VPC ↔ VPC. tgw-attachment: VPC (or a Network Firewall attached directly) → transit gateway. vpn: Site-to-Site VPN connection → its virtual private gateway or transit gateway. targets: load balancer → target, or CloudFront distribution → origin. invokes: event source or caller → Lambda, API Gateway → its integration, or Lambda → downstream. connects: application → data store."
+        },
+        "from": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Node id."
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Node id."
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "from",
+        "to"
+      ],
+      "additionalProperties": false,
+      "description": "A non-containment relationship between two nodes."
+    }
+  }
+}

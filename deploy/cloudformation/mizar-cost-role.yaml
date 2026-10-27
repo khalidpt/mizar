@@ -1,0 +1,88 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Mizar cost reader, for the account Mizar reads spend from (normally the management account, which sees every
+  account's costs). Deploy it as a plain stack there; not needed when the collector runs in that account itself.
+  Reads Cost Explorer totals only: no invoices, payment methods, budgets or billing settings.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Who may assume this role }
+        Parameters: [CollectorAccountId, CollectorRoleName, CollectorRolePath, ExternalId]
+      - Label: { default: This role }
+        Parameters: [RoleName, RolePath]
+
+Parameters:
+  CollectorAccountId:
+    Type: String
+    AllowedPattern: "^\\d{12}$"
+    Description: Account where the Mizar collector runs (the hosting account).
+  CollectorRoleName:
+    Type: String
+    Default: MizarCollector
+    Description: Name of the collector's role in that account (mizar-collector-role.yaml).
+  CollectorRolePath:
+    Type: String
+    Default: /
+    AllowedPattern: "^/(.*/)?$"
+    Description: IAM path of the collector's role.
+  RoleName:
+    Type: String
+    Default: MizarCostReader
+    Description: Name of this role; must match the collector's aws.cost.roleName setting.
+  RolePath:
+    Type: String
+    Default: /
+    AllowedPattern: "^/(.*/)?$"
+    Description: IAM path of this role; must match the collector's aws.cost.rolePath setting.
+  ExternalId:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Optional external id the collector must present (its aws.externalId setting). Empty for none.
+
+Conditions:
+  HasExternalId: !Not [!Equals [!Ref ExternalId, ""]]
+
+Resources:
+  CostReaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Path: !Ref RolePath
+      Description: Mizar collector cost reader (Cost Explorer totals only)
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # As for the member role: the account as principal plus a PrincipalArn condition, so only the collector
+          # role may assume this role and the stacks can be created in any order.
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${CollectorAccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              ArnEquals:
+                aws:PrincipalArn: !Sub "arn:${AWS::Partition}:iam::${CollectorAccountId}:role${CollectorRolePath}${CollectorRoleName}"
+              StringEquals: !If
+                - HasExternalId
+                - sts:ExternalId: !Ref ExternalId
+                - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: MizarCost
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Cost Explorer has no resource-level permissions for this action.
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                Resource: "*"
+      Tags:
+        - Key: mizar:component
+          Value: cost-role
+
+Outputs:
+  RoleArn:
+    Description: Role the collector assumes to read costs.
+    Value: !GetAtt CostReaderRole.Arn
