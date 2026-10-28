@@ -6,6 +6,8 @@ AWS infrastructure visualizer
 the accounts you pick - down to regions, VPCs, subnets and the resources inside them, plus how they connect, as an
 interactive sci-fi 3D scene or a clean 2D architecture diagram. Self-hosted, read-only, and your data never leaves your AWS account.
 
+**Live demo: [mizar.khalid.pt](https://mizar.khalid.pt)**
+
 > **Status: early development.** The visualization, snapshot pipeline and CLI work today against a built-in
 > **simulated organization**. The first collector for real AWS accounts (direct read-only API calls) is
 > **experimental**. Nothing is published to a container registry or AWS Marketplace yet.
@@ -54,7 +56,7 @@ your deployment - which account hosts it, where it runs and where snapshots live
 Requires **Node.js 20.9+**. No AWS account is needed to try it.
 
 ```bash
-git clone <repository-url> mizar && cd mizar
+git clone https://github.com/khalidpt/mizar.git && cd mizar
 npm install
 
 npm run mizar -- collect     # take a snapshot of the simulated organization
