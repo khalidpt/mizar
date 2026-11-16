@@ -384,12 +384,6 @@ Resources:
               - HasClientSecret
               - { Name: MIZAR_AUTH_CLIENT_SECRET, ValueFrom: !Ref ClientSecret }
               - !Ref AWS::NoValue
-          HealthCheck:
-            Command: [CMD-SHELL, "wget -qO- http://127.0.0.1:3000/healthz >/dev/null || exit 1"]
-            Interval: 30
-            Timeout: 5
-            Retries: 3
-            StartPeriod: 20
           LogConfiguration:
             LogDriver: awslogs
             Options:
